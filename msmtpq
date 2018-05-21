@@ -1,0 +1,301 @@
+#!/bin/sh
+
+set -e
+
+config_dir="${XDG_CONFIG_DIR:-${HOME}/.config}"/"$(basename "$0")"
+config_file="${MSMTPQ_CONFIG:-${config_dir}/default.conf}"
+function _usage {
+    local options=(
+        '-c,--config <FILE>'
+        '-l,--list'
+        '-r,--run'
+        '-v,--verbose'
+        '-n,--dry-run'
+        '-h,--help'
+    )
+    local descriptions=(
+        "Use the given configuration file instead of the default one (${config_file}), can also be set with \`\$MSMTPQ_CONFIG\`"
+        "List all queued emails. If used with \`--verbose\`, the full emails are printed"
+        "Try to send all the emails in the queue"
+        "Turn on verbose output"
+        "don't store emails in queue but show only what actions would have been taken if $(basename "$0") would have run normally (with or without --run), implies --verbose"
+        "display help"
+    )
+    # The offset options will get
+    local options_offset=3
+    # The offset descriptions will get after the longest option
+    local descriptions_offset_after_longest_option=5
+    # The maximum length of descriptions spanning
+    local maximum_descriptions_length=80
+    # First we print the classic Usage message
+    echo "Usage: $(basename "$0") [OPTION]..."
+    # In the next loop, we put in ${max_option_length} the length of the
+    # longest option. This way, we'll be able to calculate the offset when
+    # printing long descriptions that should span over several lines.
+    local max_option_length=1
+    for (( i = 0; i < ${#options[@]}; i++)); do
+        if [[ $max_option_length -lt ${#options[$i]} ]]; then
+            max_option_length=${#options[$i]}
+        fi
+    done
+    # We put in the following variable the total offset of descriptions
+    # after new-lines.
+    local descriptions_new_line_offset=$((${max_option_length} + ${options_offset} + ${descriptions_offset_after_longest_option}))
+    # The next loop is the main loop where we actually print the options with
+    # the corresponding descriptions.
+    for (( i = 0; i < ${#options[@]}; i++)); do
+        # First, we print the option and the offset we chose above right before it
+        printf -- '%*s' ${options_offset}
+        printf -- '%s' "${options[$i]}"
+        # Here we start tracking through out this loop the current index of the
+        # char on the terminal window. This is necessary because in the process
+        # of printing the descriptions' words we'll be able to know how not to
+        # span over the defined maximum length or not to split words when
+        # hitting ${COLUMNS}
+        local current_char_index=$((${options_offset} + ${#options[$i]}))
+        # We calculate the offset which should be given between the current
+        # option and the start of it's description. This is different for every
+        # option because every option has a different length but they all must
+        # be aligned according to the longest option's length and the offsets
+        # we chose above
+        local current_description_offset=$((${max_option_length} - ${#options[$i]} + ${descriptions_offset_after_longest_option}))
+        # We print this offset before printing the description
+        printf -- '%*s' ${current_description_offset}
+        # Updating the current_char_index
+        current_char_index=$((${current_char_index} + ${current_description_offset}))
+        # We put in a temporary variable the current description from the array
+        local current_description="${descriptions[$i]}"
+        # We divide the current_description to an array with the description's
+        # words as the array's elements. This is necessary so we can print the
+        # description without spliting words
+        IFS=' ' read -r -a description_words <<< "${current_description}"
+        # We start a loop for every word in the descriptions words array
+        for (( j = 0; j < ${#description_words[@]}; j++)); do
+            # We update the current char index before actually printing the
+            # next word in the description because of the condition right
+            # afterwards
+            current_char_index=$((${current_char_index} + ${#description_words[$j]} + 1))
+            # We check if the index we will reach will hit the maximum limit we
+            # chose in the beginning or the number of ${COLUMNS} our terminal
+            # gives us
+            if [[ ${current_char_index} -le ${COLUMNS} ]] && [[ ${current_char_index} -le ${maximum_descriptions_length} ]]; then
+                # If we don't hit our limit, print the current word
+                printf -- '%s ' ${description_words[$j]}
+            else
+                # If we've hit our limit, print a new line
+                printf -- '\n'
+                # Print a number of spaces equals to the offset we need to give
+                # according to longest option we have and the other offsets we
+                # defined above
+                printf -- '%*s' ${descriptions_new_line_offset}
+                # print the next word in the new line
+                printf -- '%s ' ${description_words[$j]}
+                # Update the current char index
+                current_char_index=$((${descriptions_new_line_offset} + ${#description_words[$j]}))
+            fi
+        done
+        # print a new line between every option and it's description
+        printf '\n'
+    done
+}
+
+function _list {
+    cd "${QUEUEDIR}"
+    if [[ $? != 0 ]]; then
+        echo "Couldn't cd into queue dir (${QUEUEDIR})" > /dev/stderr
+        exit 4
+    fi
+    set +e
+    for i in *.mail; do
+        printf -v line '%*s' "${#i}"
+        echo ${line// /-}
+        echo $i
+        echo ${line// /-}
+        if [[ $verbose == "true" ]]; then
+            cat "$i"
+        else
+            egrep -s --color=auto -h '(^From:|^To:|^Subject:)' "$i"
+            if [[ $? != 0 ]]; then
+                cat "$i"
+            fi
+        fi
+    done
+    set -e
+}
+
+function _run {
+    if [[ -f ${LOCKFILE} ]]; then
+        cat <<EOM
+Cannot use queue dir (${QUEUEDIR}) since it contains a lockfile
+If you are sure that no other instance of this script is
+running, then delete the lock file.
+EOM
+        exit 4
+    fi
+    touch ${LOCKFILE}
+    if [[ $? != 0 ]]; then
+        echo "couldn't create a lockfile (${LOCKFILE})" > /dev/stderr
+        exit 4
+    fi
+    cd "${QUEUEDIR}"
+    if [[ $? != 0 ]]; then
+        echo "Couldn't cd into queue dir (${QUEUEDIR})" > /dev/stderr
+        exit 4
+    fi
+    set +e
+    for MAILFILE in *.mail; do
+        MSMTPFILE="$(echo $MAILFILE | sed -e 's/mail/msmtp/')"
+        if [ ! -f "$MSMTPFILE" ]; then
+            echo "No corresponding file $MSMTPFILE found" > /dev/stderr
+            continue
+        fi
+        echo "*** Sending $MAILFILE to `sed -e 's/^.*-- \(.*$\)/\1/' $MSMTPFILE` ..."
+        msmtp $(cat "$MSMTPFILE") < "$MAILFILE"
+        if [ $? -eq 0 ]; then
+            rm "$MAILFILE" "$MSMTPFILE"
+            echo "$MAILFILE sent successfully"
+        else
+            echo "FAILURE"
+        fi
+    done
+    rm -f "$LOCKFILE"
+    set -e
+}
+
+function _enqueue {
+    cd "${QUEUEDIR}"
+    if [[ $? != 0 ]]; then
+        echo "Couldn't cd into queue dir (${QUEUEDIR})" > /dev/stderr
+        exit 4
+    fi
+    umask "${UMASK}"
+    # Create new unique filenames of the form
+    # MAILFILE:  ccyy-mm-dd-hh.mm.ss[-x].mail
+    # MSMTPFILE: ccyy-mm-dd-hh.mm.ss[-x].msmtp
+    # where x is a consecutive number only appended if you send more than one 
+    # mail per second.
+    BASE="$(date +${DATEFORMAT})"
+    if [ -f "$BASE.mail" -o -f "$BASE.msmtp" ]; then
+        TMP="$BASE"
+        i=1
+        while [ -f "$TMP-$i.mail" -o -f "$TMP-$i.msmtp" ]; do
+            i=`expr $i + 1`
+        done
+        BASE="$BASE-$i"
+    fi
+    MAILFILE="$BASE.mail"
+    MSMTPFILE="$BASE.msmtp"
+    # Write command line to $MSMTPFILE
+    echo "$@" > "$MSMTPFILE" || exit 1
+    # Write the mail to $MAILFILE
+    cat > "$MAILFILE" || exit 1
+}
+
+action=enqueue
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case "$key" in
+        "--config"|"-c")
+            if [[ -f "$2" ]]; then
+                config_file="$2"
+            elif [[ -f "${config_dir}"/"$2".conf ]]; then
+                config_file="${config_dir}"/"$2".conf
+            else
+                echo given configuration file $2 not found > /dev/stderr
+                exit 1
+            fi
+            shift 2
+            continue
+            ;;
+        "--list"|"-l")
+            if [[ "${action}" == "enqueue" ]]; then
+                action=list
+            else
+                echo "Please don't specify multiple actions together" > /dev/stderr
+                exit 2
+            fi
+            shift
+            continue
+            ;;
+        "--run"|"-r")
+            if [[ "${action}" == "enqueue" ]]; then
+                action=run
+            else
+                echo "Please don't specify multiple actions together" > /dev/stderr
+                exit 2
+            fi
+            shift
+            continue
+            ;;
+        "--verbose"|"-v")
+            verbose=true
+            shift
+            continue
+            ;;
+        "--dry-run"|"-n")
+            dry_run=true
+            shift
+            continue
+            ;;
+        "--help"|"-h")
+            action=usage
+            exit_code=0
+            shift
+            break
+            ;;
+        *)
+            action=usage
+            exit_code=2
+            shift
+            break
+            ;;
+    esac
+done
+
+if [[ -f "${config_file}" ]]; then
+    source "${config_file}"
+    if [[ $? != 0 ]]; then
+        echo "there appeared to be some errors when sourcing the configuration file (${config_file}), exiting" > /dev/stderr
+        exit 3
+    fi
+fi
+if [[ -z ${QUEUEDIR} ]]; then
+    QUEUEDIR="${HOME}/.msmtpq"
+    if [[ $verbose == "true" ]]; then
+        echo "QUEUEDIR is not set in configuration file or environment, using default (${QUEUEDIR})" > /dev/stderr
+    fi
+fi
+if [[ -z ${DATEFORMAT} ]]; then
+    DATEFORMAT="%Y-%m-%d-%H.%M.%S"
+    if [[ $verbose == "true" ]]; then
+        echo "DATEFORMAT is not set in configuration file or environment, using default (${DATEFORMAT})" > /dev/stderr
+    fi
+fi
+if [[ -z ${LOCKFILE} ]]; then
+    LOCKFILE="${QUEUEDIR}/.lock"
+    if [[ $verbose == "true" ]]; then
+        echo "LOCKFILE is not set in configuration file or environment, using default (${LOCKFILE})" > /dev/stderr
+    fi
+fi
+if [[ -z ${UMASK} ]]; then
+    UMASK=077
+    if [[ $verbose == "true" ]]; then
+        echo "UMASK is not set in configuration file or environment, using default (${UMASK})" > /dev/stderr
+    fi
+fi
+
+case "${action}" in
+    usage)
+        _usage
+        exit ${exit_code}
+        ;;
+    list)
+        _list
+        ;;
+    run)
+        _run
+        ;;
+    enqueue)
+        _enqueue "$@"
+        ;;
+esac
